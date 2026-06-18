@@ -40,18 +40,25 @@ class Key(enum.Enum):
     RIGHT = "\033[C"
 
 @contextmanager
-def terminal(fd: Optional[int] = None) -> Iterator["Terminal"]:
+def terminal(
+    fd: Optional[int] = None, alt_screen: bool = True
+) -> Iterator["Terminal"]:
     """
-    Saves termios attributes, applies raw mode, and ensures
-    cursor visibility on exit.
+    Saves termios attributes, applies raw mode, switches to the
+    alternate screen buffer, and restores everything on exit.
     """
     fd = sys.stdin.fileno() if fd is None else fd
     original_attrs = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
+        if alt_screen:
+            sys.stdout.write("\033[?1049h")
+            sys.stdout.flush()
         yield Terminal(fd)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, original_attrs)
+        if alt_screen:
+            sys.stdout.write("\033[?1049l")
         sys.stdout.write(cursor(True))
         sys.stdout.flush()
 
@@ -450,7 +457,7 @@ def test_terminal_size_runtime(tmux): # pylint: disable=redefined-outer-name
                 return key
             return key.name
 
-        with term.terminal() as t:
+        with term.terminal(alt_screen=False) as t:
             print("READY", flush=True)
             for _ in range(3):
                 key = t.key()
@@ -484,7 +491,7 @@ def test_terminal(tmux): # pylint: disable=redefined-outer-name
         fd = sys.stdin.fileno()
         orig = termios.tcgetattr(fd)
 
-        with terminal(fd):
+        with terminal(fd, alt_screen=False):
             raw = termios.tcgetattr(fd)
             if raw != orig:
                 print("ATTRS_CHANGED")
@@ -510,7 +517,7 @@ def test_terminal_exception(tmux): # pylint: disable=redefined-outer-name
         orig = termios.tcgetattr(fd)
 
         try:
-            with term.terminal(fd):
+            with term.terminal(fd, alt_screen=False):
                 raw = termios.tcgetattr(fd)
                 if raw != orig:
                     print("IN_RAW", flush=True)
@@ -530,6 +537,33 @@ def test_terminal_exception(tmux): # pylint: disable=redefined-outer-name
     assert tmux.wait_for("RESTORED")
     assert tmux.wait_for("ICANON_ON")
 
+def test_terminal_alt_screen(tmux): # pylint: disable=redefined-outer-name
+    """Verify alt-screen preserves main screen content across terminal()."""
+    tmux.run_python("""
+        import terminal as term
+
+        print("MARKER_BEFORE", flush=True)
+        with term.terminal() as t:
+            t.write(term.clear_screen(), term.move_to(1, 1), "INSIDE_ALT")
+            print("LOOP_READY", flush=True)
+            t.key()
+        print("MARKER_AFTER", flush=True)
+    """)
+
+    assert tmux.wait_for("LOOP_READY")
+    # While inside alt-screen, the main-screen marker must be hidden.
+    content = "\n".join(tmux.capture_pane())
+    assert "MARKER_BEFORE" not in content
+    assert "INSIDE_ALT" in content
+
+    tmux.send_keys("a")
+    assert tmux.wait_for("MARKER_AFTER")
+    # After exit, main screen is restored: marker back, alt-screen gone.
+    content = "\n".join(tmux.capture_pane())
+    assert "MARKER_BEFORE" in content
+    assert "MARKER_AFTER" in content
+    assert "INSIDE_ALT" not in content
+
 def test_terminal_flow(tmux): # pylint: disable=redefined-outer-name
     """Integration test for terminal helpers in raw mode."""
     tmux.resize(120, 30)
@@ -542,7 +576,7 @@ def test_terminal_flow(tmux): # pylint: disable=redefined-outer-name
                 return key
             return key.name
 
-        with term.terminal() as t:
+        with term.terminal(alt_screen=False) as t:
             cols, rows = t.size()
             t.write(
                 term.clear_screen(),
