@@ -126,6 +126,54 @@ def cursor(visible: bool, shape: str = "block", blink: bool = True) -> str:
     }
     return f"\033[{codes[(shape, blink)]} q\033[?25h"
 
+class Color(enum.Enum):
+    """Foreground SGR color codes; the background code is this plus 10."""
+    BLACK = 30
+    RED = 31
+    GREEN = 32
+    YELLOW = 33
+    BLUE = 34
+    MAGENTA = 35
+    CYAN = 36
+    WHITE = 37
+    DEFAULT = 39
+    BRIGHT_BLACK = 90
+    BRIGHT_RED = 91
+    BRIGHT_GREEN = 92
+    BRIGHT_YELLOW = 93
+    BRIGHT_BLUE = 94
+    BRIGHT_MAGENTA = 95
+    BRIGHT_CYAN = 96
+    BRIGHT_WHITE = 97
+
+def style( # pylint: disable=too-many-arguments,too-many-positional-arguments
+    text: str,
+    fg: Optional[Color] = None,
+    bg: Optional[Color] = None,
+    bold: bool = False,
+    italic: bool = False,
+    underline: bool = False,
+    reverse: bool = False,
+) -> str:
+    """Returns text wrapped in SGR codes, always reset afterwards."""
+    codes: List[int] = []
+    if bold:
+        codes.append(1)
+    if italic:
+        codes.append(3)
+    if underline:
+        codes.append(4)
+    if reverse:
+        codes.append(7)
+    if fg is not None:
+        codes.append(fg.value)
+    if bg is not None:
+        codes.append(bg.value + 10)
+    if not codes:
+        return text
+    joined = ";".join(str(code) for code in codes)
+    return f"\033[{joined}m{text}\033[0m"
+
 def save_pos() -> str:
     """Returns ANSI sequence to save cursor position."""
     return "\033[s"
@@ -258,6 +306,13 @@ class TmuxHelper:
         result = self._run_tmux("capture-pane", "-p", "-t", self.session_name)
         return result.stdout.splitlines()
 
+    def capture_escapes(self) -> str:
+        """Returns pane content with ANSI escape sequences preserved."""
+        result = self._run_tmux(
+            "capture-pane", "-p", "-e", "-t", self.session_name
+        )
+        return result.stdout
+
     def resize(self, columns: int, rows: int):
         """Resizes the tmux window."""
         self._run_tmux(
@@ -345,6 +400,48 @@ def test_ansi_sequences():
     assert cursor(True, shape="bar", blink=False) == "\033[6 q\033[?25h"
     assert save_pos() == "\033[s"
     assert restore_pos() == "\033[u"
+
+def test_style():
+    """Verify SGR styling wraps text and always resets."""
+    assert style("hi") == "hi"
+    assert style("hi", fg=Color.RED) == "\033[31mhi\033[0m"
+    assert style("hi", bg=Color.BLUE) == "\033[44mhi\033[0m"
+    assert style("hi", fg=Color.BRIGHT_WHITE) == "\033[97mhi\033[0m"
+    assert style("hi", bg=Color.BRIGHT_BLACK) == "\033[100mhi\033[0m"
+    assert style("hi", bold=True) == "\033[1mhi\033[0m"
+    assert style("hi", italic=True) == "\033[3mhi\033[0m"
+    assert style("hi", underline=True) == "\033[4mhi\033[0m"
+    assert style("hi", reverse=True) == "\033[7mhi\033[0m"
+    assert style(
+        "hi", fg=Color.GREEN, bg=Color.BLACK, bold=True
+    ) == "\033[1;32;40mhi\033[0m"
+    assert style(
+        "hi", fg=Color.RED, bold=True, italic=True, underline=True
+    ) == "\033[1;3;4;31mhi\033[0m"
+
+def test_style_no_leak(tmux): # pylint: disable=redefined-outer-name
+    """Verify styled output resets before later unstyled text."""
+    tmux.resize(80, 24)
+    tmux.run_python("""
+        import terminal as term
+        from terminal import Color
+
+        with term.terminal() as t:
+            t.write(
+                term.clear_screen(),
+                term.move_to(1, 1),
+                term.style("STYLED", fg=Color.RED, bold=True),
+                term.move_to(2, 1),
+                "PLAIN",
+            )
+            t.key()
+    """)
+
+    assert tmux.wait_for("PLAIN")
+    styled_line, plain_line = tmux.capture_escapes().splitlines()[:2]
+    assert styled_line == "\033[1m\033[31mSTYLED\033[0m"
+    assert plain_line == "PLAIN"
+    tmux.send_keys("a")
 
 def test_terminal_write(capsys):
     """Verify Terminal.write joins sequences and flushes to stdout."""
