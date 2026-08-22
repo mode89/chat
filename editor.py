@@ -14,9 +14,11 @@ from dataclasses import dataclass, replace
 from typing import List, Sequence, Tuple, Union
 
 from terminal import ( # pylint: disable=unused-import
+    CursorShape,
     Key,
     Paste,
     Resize,
+    Unknown,
     clear_screen,
     cursor,
     move_to,
@@ -223,7 +225,7 @@ def resize_state(state: EditorState, cols: int, rows: int) -> EditorState:
 
 def should_insert_char(key: Union[Key, str]) -> bool:
     """Checks whether a key should be inserted as text."""
-    return isinstance(key, str) and len(key) == 1 and key.isprintable()
+    return isinstance(key, str) and key.isprintable()
 
 
 def parse_command(cmd: str) -> Tuple[str, str]:
@@ -363,18 +365,20 @@ def render(state: EditorState) -> str:
     if state.mode == Mode.COMMAND:
         cmd_col = min(len(":" + state.command) + 1, state.cols)
         parts.append(move_to(cmd_row, cmd_col))
-        parts.append(cursor(True, shape="bar", blink=False))
+        parts.append(cursor(True, shape=CursorShape.BAR, blink=False))
     elif text_rows > 0:
         row, col = state.cursor
         cursor_screen_row = row - top + 1
         cursor_screen_row = max(1, min(cursor_screen_row, text_rows))
         cursor_screen_col = max(1, min(col + 1, state.cols))
         parts.append(move_to(cursor_screen_row, cursor_screen_col))
-        shape = "bar" if state.mode == Mode.INSERT else "block"
+        shape = (
+            CursorShape.BAR if state.mode == Mode.INSERT else CursorShape.BLOCK
+        )
         parts.append(cursor(True, shape=shape, blink=False))
     else:
         parts.append(move_to(1, 1))
-        parts.append(cursor(True, shape="block", blink=False))
+        parts.append(cursor(True, shape=CursorShape.BLOCK, blink=False))
 
     return "".join(parts)
 
@@ -434,6 +438,8 @@ def run_editor(file_path: pathlib.Path) -> int:
 
         while not state.should_quit:
             event = term.event()
+            if isinstance(event, Unknown):
+                continue
             if isinstance(event, Resize):
                 state = dispatch(state, ResizeEvent(event.cols, event.rows))
             else:
@@ -550,13 +556,13 @@ def test_render_status_mode_size():
 def test_render_normal_mode_cursor():
     """Normal mode renders a steady block cursor."""
     state = make_state(["hello"], mode=Mode.NORMAL, size=(30, 6))
-    assert cursor(True, shape="block", blink=False) in render(state)
+    assert cursor(True, shape=CursorShape.BLOCK, blink=False) in render(state)
 
 
 def test_render_insert_mode_cursor():
     """Insert mode renders a steady bar cursor."""
     state = make_state(["hello"], mode=Mode.INSERT, size=(30, 6))
-    assert cursor(True, shape="bar", blink=False) in render(state)
+    assert cursor(True, shape=CursorShape.BAR, blink=False) in render(state)
 
 
 def test_scroll_cursor_moves_before_viewport_scrolls():
@@ -712,7 +718,7 @@ def test_render_command_mode_cursor():
     """Command mode renders a bar cursor in the command line."""
     state = make_state(["hello"], size=(30, 6))
     state = replace(state, mode=Mode.COMMAND, command="")
-    assert cursor(True, shape="bar", blink=False) in render(state)
+    assert cursor(True, shape=CursorShape.BAR, blink=False) in render(state)
 
 
 def test_editor_save_quit(tmp_path, tmux): # pylint: disable=redefined-outer-name
@@ -725,13 +731,13 @@ def test_editor_save_quit(tmp_path, tmux): # pylint: disable=redefined-outer-nam
     tmux.resize(80, 24)
     tmux.send_keys(f"python3 {editor_path} {file_path}", Key.ENTER)
 
-    assert tmux.wait_for("-- NORMAL --")
+    tmux.wait_for("-- NORMAL --")
 
     tmux.send_keys("i", "X", Key.ESCAPE)
-    assert tmux.wait_for("-- NORMAL --")
+    tmux.wait_for("-- NORMAL --")
 
     tmux.send_keys(":")
-    assert tmux.wait_for(":")
+    tmux.wait_for(":")
     tmux.send_keys("w", "q", Key.ENTER)
     time.sleep(0.2)
 

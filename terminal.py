@@ -62,7 +62,12 @@ class Resize:
     cols: int
     rows: int
 
-Event = Union[Key, str, Paste, Resize, None]
+@dataclass(frozen=True)
+class Unknown:
+    """An escape sequence this library does not map to a Key."""
+    sequence: str
+
+Event = Union[Key, str, Paste, Resize, Unknown, None]
 
 @contextmanager
 def terminal(
@@ -88,27 +93,30 @@ def terminal(
     try:
         tty.setraw(fd)
         if alt_screen:
-            sys.stdout.write("\033[?1049h")
-        sys.stdout.write("\033[?2004h")
+            sys.stdout.write(alt_screen_mode(True))
+        sys.stdout.write(paste_mode(True))
         sys.stdout.flush()
         yield Terminal(fd, resize_read)
     finally:
+        # Restore the handler before closing the pipe it writes to.
         signal.signal(signal.SIGWINCH, previous_winch)
         os.close(resize_write)
         os.close(resize_read)
         termios.tcsetattr(fd, termios.TCSADRAIN, original_attrs)
-        sys.stdout.write("\033[?2004l")
+        sys.stdout.write(paste_mode(False))
         if alt_screen:
-            sys.stdout.write("\033[?1049l")
+            sys.stdout.write(alt_screen_mode(False))
+        # Show the cursor last: leaving the alternate screen restores the
+        # saved cursor position, so this must land on the main screen.
         sys.stdout.write(cursor(True))
         sys.stdout.flush()
 
 
 class Terminal:
-    """Terminal facade for output, size queries, and input events."""
+    """Reads input events from a terminal; writes output to stdout."""
 
-    def __init__(self, fd: int, resize_fd: Optional[int] = None):
-        self.fd = fd
+    def __init__(self, input_fd: int, resize_fd: int):
+        self.input_fd = input_fd
         self.resize_fd = resize_fd
 
     def write(self, *sequences: str):
@@ -119,9 +127,8 @@ class Terminal:
     def size(self) -> Tuple[int, int]:
         """Returns terminal size as (columns, rows)."""
         try:
-            with open("/dev/tty", "rb") as tty_device:
-                size = os.get_terminal_size(tty_device.fileno())
-        except OSError:
+            size = os.get_terminal_size(self.input_fd)
+        except OSError:  # input is not a tty, e.g. a pipe under test
             size = shutil.get_terminal_size()
         return size.columns, size.lines
 
@@ -130,33 +137,108 @@ class Terminal:
 
         timeout: seconds to wait for the first byte; None waits forever,
         0 polls. Returns None when no event arrives in time. Once an
-        event starts arriving it is always read to completion.
+        event starts arriving it is always read to completion. Raises
+        EOFError when the input side is closed.
         """
-        watched = [self.fd]
-        if self.resize_fd is not None:
-            watched.append(self.resize_fd)
-
+        watched = [self.input_fd, self.resize_fd]
         ready = select.select(watched, [], [], timeout)[0]
         if not ready:
             return None
         if self.resize_fd in ready:
             os.read(self.resize_fd, 64)  # coalesce a burst into one Resize
-            return Resize(*self.size())
+            cols, rows = self.size()
+            return Resize(cols=cols, rows=rows)
 
-        first = os.read(self.fd, 1)
-        while not first:
-            first = os.read(self.fd, 1)
+        first = os.read(self.input_fd, 1)
+        if not first:
+            raise EOFError("terminal input closed")
+
         code = first[0]
-
-        if code in (8, Key.BACKSPACE.value):
-            return Key.BACKSPACE
         if code == Key.ESCAPE.value:
-            return _parse_escape(self.fd)
-
-        single_key = _key_from_value(code)
-        if single_key is not None:
-            return single_key
+            return _parse_escape(self.input_fd)
+        key = _key_from_value(code)
+        if key is not None:
+            return key
         return first.decode("utf-8", errors="ignore")
+
+_ESCAPE_TIMEOUT = 0.1  # ESC alone, or the start of a longer sequence?
+_CSI_TIMEOUT = 0.05
+_PASTE_TIMEOUT = 1.0
+_PASTE_START = "\033[200~"
+_PASTE_END = "\033[201~"
+_KEY_ALIASES = {8: Key.BACKSPACE}  # some terminals send BS, not DEL
+
+def _key_from_value(value: Union[int, str]) -> Optional[Key]:
+    """Converts a key code or ANSI sequence to Key when supported."""
+    alias = _KEY_ALIASES.get(value)
+    if alias is not None:
+        return alias
+    try:
+        return Key(value)
+    except ValueError:
+        return None
+
+def _parse_escape(fd: int) -> Union[Key, Paste, Unknown]:
+    """Parses an escape-prefixed key sequence from fd."""
+    if not select.select([fd], [], [], _ESCAPE_TIMEOUT)[0]:
+        return Key.ESCAPE
+
+    second = os.read(fd, 1)
+    if second != b"[":
+        tail = (second + _read_available(fd)).decode("utf-8", errors="ignore")
+        return Unknown("\033" + tail)
+
+    sequence = "\033[" + _read_csi(fd)
+    if sequence == _PASTE_START:
+        return Paste(_read_paste(fd))
+    key = _key_from_value(sequence)
+    return key if key is not None else Unknown(sequence)
+
+def _read_csi(fd: int) -> str:
+    """Reads CSI bytes up to and including the final byte (0x40-0x7E)."""
+    chunks = []
+    while select.select([fd], [], [], _CSI_TIMEOUT)[0]:
+        byte = os.read(fd, 1)
+        if not byte:
+            break
+        chunks.append(byte)
+        if 0x40 <= byte[0] <= 0x7E:
+            break
+    return b"".join(chunks).decode("utf-8", errors="ignore")
+
+def _read_paste(fd: int) -> str:
+    """Reads pasted bytes up to the bracketed-paste end marker."""
+    end_marker = _PASTE_END.encode()
+    buffer = bytearray()
+    # One byte per read: a chunked read would run past the end marker and
+    # swallow keystrokes typed right after the paste.
+    while not buffer.endswith(end_marker):
+        if not select.select([fd], [], [], _PASTE_TIMEOUT)[0]:
+            break
+        byte = os.read(fd, 1)
+        if not byte:
+            break
+        buffer += byte
+    text = bytes(buffer).decode("utf-8", errors="replace")
+    return _sanitize_paste(text.removesuffix(_PASTE_END))
+
+def _sanitize_paste(text: str) -> str:
+    """Normalizes newlines and drops control characters from pasted text."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(
+        char for char in text
+        if char in "\n\t" or (ord(char) >= 32 and ord(char) != 127)
+    )
+
+def _read_available(fd: int) -> bytes:
+    """Reads all currently-available bytes from fd without blocking."""
+    chunks = []
+    while select.select([fd], [], [], 0)[0]:
+        chunk = os.read(fd, 1)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 def clear_screen() -> str:
     """Returns ANSI sequence to clear screen."""
@@ -166,23 +248,41 @@ def move_to(row: int, col: int) -> str:
     """Returns ANSI sequence to move cursor to row and col."""
     return f"\033[{row};{col}H"
 
-def cursor(visible: bool, shape: str = "block", blink: bool = True) -> str:
+def alt_screen_mode(enabled: bool) -> str:
+    """Returns ANSI sequence to enter or leave the alternate screen."""
+    return "\033[?1049h" if enabled else "\033[?1049l"
+
+def paste_mode(enabled: bool) -> str:
+    """Returns ANSI sequence to turn bracketed paste on or off."""
+    return "\033[?2004h" if enabled else "\033[?2004l"
+
+class CursorShape(enum.Enum):
+    """Cursor shapes a terminal can draw."""
+    BLOCK = "block"
+    UNDERLINE = "underline"
+    BAR = "bar"
+
+_CURSOR_SHAPE_CODES = {
+    (CursorShape.BLOCK,     True):  1,
+    (CursorShape.BLOCK,     False): 2,
+    (CursorShape.UNDERLINE, True):  3,
+    (CursorShape.UNDERLINE, False): 4,
+    (CursorShape.BAR,       True):  5,
+    (CursorShape.BAR,       False): 6,
+}
+
+def cursor(
+    visible: bool,
+    shape: CursorShape = CursorShape.BLOCK,
+    blink: bool = True,
+) -> str:
     """Returns ANSI sequence to set cursor visibility and shape.
 
-    shape: 'block', 'underline', or 'bar' (ignored when visible=False)
-    blink: whether the cursor blinks (ignored when visible=False)
+    shape and blink are ignored when visible=False.
     """
     if not visible:
         return "\033[?25l"
-    codes = {
-        ("block",     True):  1,
-        ("block",     False): 2,
-        ("underline", True):  3,
-        ("underline", False): 4,
-        ("bar",       True):  5,
-        ("bar",       False): 6,
-    }
-    return f"\033[{codes[(shape, blink)]} q\033[?25h"
+    return f"\033[{_CURSOR_SHAPE_CODES[(shape, blink)]} q\033[?25h"
 
 class Color(enum.Enum):
     """Foreground SGR color codes; the background code is this plus 10."""
@@ -240,80 +340,6 @@ def restore_pos() -> str:
     """Returns ANSI sequence to restore cursor position."""
     return "\033[u"
 
-_PASTE_START = "\033[200~"
-_PASTE_END = "\033[201~"
-_PASTE_TIMEOUT = 1.0
-
-def _key_from_value(value: Union[int, str]) -> Optional[Key]:
-    """Converts a key code or ANSI sequence to Key when supported."""
-    try:
-        return Key(value)
-    except ValueError:
-        return None
-
-def _parse_escape(fd: int) -> Union[Key, str, Paste]:
-    """Parses an escape-prefixed key sequence from fd."""
-    if not select.select([fd], [], [], 0.1)[0]:
-        return Key.ESCAPE
-
-    second = os.read(fd, 1)
-    if second != b"[":
-        sequence = "\033" + (second + _read_available(fd)).decode(
-            "utf-8", errors="ignore"
-        )
-        return _key_from_value(sequence) or sequence
-
-    sequence = "\033[" + _read_csi(fd)
-    if sequence == _PASTE_START:
-        return Paste(_read_paste(fd))
-    return _key_from_value(sequence) or sequence
-
-def _read_csi(fd: int) -> str:
-    """Reads CSI bytes up to and including the final byte (0x40-0x7E)."""
-    chunks = []
-    while select.select([fd], [], [], 0.05)[0]:
-        byte = os.read(fd, 1)
-        if not byte:
-            break
-        chunks.append(byte)
-        if 0x40 <= byte[0] <= 0x7E:
-            break
-    return b"".join(chunks).decode("utf-8", errors="ignore")
-
-def _read_paste(fd: int) -> str:
-    """Reads pasted bytes up to the bracketed-paste end marker."""
-    end_marker = _PASTE_END.encode()
-    buffer = bytearray()
-    # One byte per read: a chunked read would run past the end marker and
-    # swallow keystrokes typed right after the paste.
-    while not buffer.endswith(end_marker):
-        if not select.select([fd], [], [], _PASTE_TIMEOUT)[0]:
-            break
-        byte = os.read(fd, 1)
-        if not byte:
-            break
-        buffer += byte
-    text = bytes(buffer).decode("utf-8", errors="replace")
-    return _sanitize_paste(text.removesuffix(_PASTE_END))
-
-def _sanitize_paste(text: str) -> str:
-    """Normalizes newlines and drops control characters from pasted text."""
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    return "".join(
-        char for char in text
-        if char in "\n\t" or (ord(char) >= 32 and ord(char) != 127)
-    )
-
-def _read_available(fd: int) -> bytes:
-    """Reads all currently-available bytes from fd without blocking."""
-    chunks = []
-    while select.select([fd], [], [], 0)[0]:
-        chunk = os.read(fd, 1)
-        if not chunk:
-            break
-        chunks.append(chunk)
-    return b"".join(chunks)
-
 # --- Testing ---
 
 try:
@@ -322,35 +348,47 @@ except ImportError:
     from unittest import mock
     pytest = mock.MagicMock()
 
+@contextmanager
+def pipe_terminal() -> Iterator[Tuple[Terminal, int, int]]:
+    """Yields a Terminal fed by pipes, as (terminal, input, resize)."""
+    read_fd, write_fd = os.pipe()
+    resize_read, resize_write = os.pipe()
+    try:
+        yield Terminal(read_fd, resize_read), write_fd, resize_write
+    finally:
+        for fd in (read_fd, write_fd, resize_read, resize_write):
+            os.close(fd)
+
+_TMUX_KEYS = {
+    Key.CTRL_A: "C-a",
+    Key.CTRL_B: "C-b",
+    Key.CTRL_E: "C-e",
+    Key.CTRL_F: "C-f",
+    Key.CTRL_K: "C-k",
+    Key.CTRL_J: "C-j",
+    Key.CTRL_U: "C-u",
+    Key.CTRL_W: "C-w",
+    Key.TAB: "Tab",
+    Key.SHIFT_TAB: "BTab",
+    Key.ENTER: "Enter",
+    Key.CTRL_C: "C-c",
+    Key.ESCAPE: "Escape",
+    Key.BACKSPACE: "BSpace",
+    Key.DELETE: "Delete",
+    Key.PAGE_UP: "PageUp",
+    Key.PAGE_DOWN: "PageDown",
+    Key.UP: "Up",
+    Key.DOWN: "Down",
+    Key.LEFT: "Left",
+    Key.RIGHT: "Right",
+}
+
 class TmuxHelper:
     """Context manager for automated terminal-based testing using tmux."""
 
-    def __init__(self, session_name: Optional[str] = None):
-        self.session_name = session_name or f"test_{int(time.time() * 1000)}"
+    def __init__(self):
+        self.session_name = f"test_{int(time.time() * 1000)}"
         self.temp_dir = None
-        self._key_map = {
-            Key.CTRL_A: "C-a",
-            Key.CTRL_B: "C-b",
-            Key.CTRL_E: "C-e",
-            Key.CTRL_F: "C-f",
-            Key.CTRL_K: "C-k",
-            Key.CTRL_J: "C-j",
-            Key.CTRL_U: "C-u",
-            Key.CTRL_W: "C-w",
-            Key.TAB: "Tab",
-            Key.SHIFT_TAB: "BTab",
-            Key.ENTER: "Enter",
-            Key.CTRL_C: "C-c",
-            Key.ESCAPE: "Escape",
-            Key.BACKSPACE: "BSpace",
-            Key.DELETE: "Delete",
-            Key.PAGE_UP: "PageUp",
-            Key.PAGE_DOWN: "PageDown",
-            Key.UP: "Up",
-            Key.DOWN: "Down",
-            Key.LEFT: "Left",
-            Key.RIGHT: "Right",
-        }
 
     def _run_tmux(self, *args):
         return subprocess.run(
@@ -388,10 +426,7 @@ class TmuxHelper:
     def send_keys(self, *keys: Union[Key, str]):
         """Translates and sends keys to the tmux session."""
         for key in keys:
-            if isinstance(key, Key):
-                tmux_key = self._key_map[key]
-            else:
-                tmux_key = str(key)
+            tmux_key = _TMUX_KEYS[key] if isinstance(key, Key) else key
             self._run_tmux("send-keys", "-t", self.session_name, tmux_key)
 
     def capture_pane(self) -> List[str]:
@@ -419,40 +454,42 @@ class TmuxHelper:
             "#{pane_tty}"
         ).stdout.strip()
 
-        deadline = time.time() + 1.0
-        while time.time() < deadline:
+        def pane_size() -> Tuple[int, int]:
             with open(pane_tty, "rb") as tty_device:
                 size = os.get_terminal_size(tty_device.fileno())
-            current = (size.columns, size.lines)
-            if current == (columns, rows):
-                return
+            return size.columns, size.lines
+
+        deadline = time.time() + 1.0
+        current = pane_size()
+        while current != (columns, rows):
+            if time.time() >= deadline:
+                raise AssertionError(
+                    "resize-window did not settle to "
+                    f"{columns}x{rows}; pane={current[0]}x{current[1]}"
+                )
             time.sleep(0.01)
+            current = pane_size()
 
-        raise AssertionError(
-            "resize-window did not settle to "
-            f"{columns}x{rows}; pane={current[0]}x{current[1]}"
-        )
-
-    def wait_for(
-        self,
-        regex: Union[str, re.Pattern],
-        timeout: float = 2.0,
-    ) -> Optional[re.Match]:
+    def wait_for(self, pattern: str, timeout: float = 2.0) -> re.Match:
         """
-        Wait for a regex match in the current pane output.
+        Waits for a regex match in the current pane output, and raises
+        AssertionError with the pane content when it never appears.
         Concatenates pane lines and allows multiline regex search.
         """
-        assert isinstance(regex, str)
-        regex = re.compile(regex, re.MULTILINE)
+        regex = re.compile(pattern, re.MULTILINE)
 
-        start_time = time.time()
-        while time.time() - start_time < timeout:
+        deadline = time.time() + timeout
+        while True:
             content = "\n".join(self.capture_pane())
             match = regex.search(content)
             if match:
                 return match
+            if time.time() >= deadline:
+                raise AssertionError(
+                    f"pattern {pattern!r} not found within {timeout}s; "
+                    f"pane content:\n{content}"
+                )
             time.sleep(0.01)
-        return None
 
     def paste(self, text: str):
         """Pastes text into the session using bracketed paste."""
@@ -481,9 +518,9 @@ def test_tmux_helper(tmux): # pylint: disable=redefined-outer-name
         name = input("prompt>")
         print(f"HELLO_{name}")
     """)
-    assert tmux.wait_for("prompt>")
+    tmux.wait_for("prompt>")
     tmux.send_keys("WORLD", Key.ENTER)
-    assert tmux.wait_for("HELLO_WORLD")
+    tmux.wait_for("HELLO_WORLD")
 
 def test_ansi_sequences():
     """Verify ANSI sequence generators return correct strings."""
@@ -491,11 +528,19 @@ def test_ansi_sequences():
     assert move_to(10, 5) == "\033[10;5H"
     assert cursor(False) == "\033[?25l"
     assert cursor(True) == "\033[1 q\033[?25h"
-    assert cursor(True, shape="block", blink=False) == "\033[2 q\033[?25h"
-    assert cursor(True, shape="underline") == "\033[3 q\033[?25h"
-    assert cursor(True, shape="underline", blink=False) == "\033[4 q\033[?25h"
-    assert cursor(True, shape="bar") == "\033[5 q\033[?25h"
-    assert cursor(True, shape="bar", blink=False) == "\033[6 q\033[?25h"
+    for shape, code in (
+        (CursorShape.BLOCK, 1),
+        (CursorShape.UNDERLINE, 3),
+        (CursorShape.BAR, 5),
+    ):
+        assert cursor(True, shape=shape) == f"\033[{code} q\033[?25h"
+        assert cursor(
+            True, shape=shape, blink=False
+        ) == f"\033[{code + 1} q\033[?25h"
+    assert alt_screen_mode(True) == "\033[?1049h"
+    assert alt_screen_mode(False) == "\033[?1049l"
+    assert paste_mode(True) == "\033[?2004h"
+    assert paste_mode(False) == "\033[?2004l"
     assert save_pos() == "\033[s"
     assert restore_pos() == "\033[u"
 
@@ -535,7 +580,7 @@ def test_style_no_leak(tmux): # pylint: disable=redefined-outer-name
             t.event()
     """)
 
-    assert tmux.wait_for("PLAIN")
+    tmux.wait_for("PLAIN")
     styled_line, plain_line = tmux.capture_escapes().splitlines()[:2]
     assert styled_line == "\033[1m\033[31mSTYLED\033[0m"
     assert plain_line == "PLAIN"
@@ -543,15 +588,14 @@ def test_style_no_leak(tmux): # pylint: disable=redefined-outer-name
 
 def test_terminal_write(capsys):
     """Verify Terminal.write joins sequences and flushes to stdout."""
-    Terminal(0).write("A", "B", "C")
+    with pipe_terminal() as (term, _, _):
+        term.write("A", "B", "C")
     captured = capsys.readouterr()
     assert captured.out == "ABC"
 
 def test_terminal_event():
-    """Verify Terminal.key handles printable and control sequences."""
-    read_fd, write_fd = os.pipe()
-    term = Terminal(read_fd)
-    try:
+    """Verify Terminal.event handles printable and control sequences."""
+    with pipe_terminal() as (term, write_fd, _):
         os.write(write_fd, b"x")
         assert term.event() == "x"
 
@@ -604,15 +648,10 @@ def test_terminal_event():
 
         os.write(write_fd, bytes([Key.ESCAPE.value]))
         assert term.event() == Key.ESCAPE
-    finally:
-        os.close(read_fd)
-        os.close(write_fd)
 
 def test_terminal_event_escape_timing():
     """Verify ESC is disambiguated by trailing-byte timing."""
-    read_fd, write_fd = os.pipe()
-    term = Terminal(read_fd)
-    try:
+    with pipe_terminal() as (term, write_fd, _):
         os.write(write_fd, b"\033")
         fast_follow = threading.Timer(0.02, os.write, args=(write_fd, b"[A"))
         fast_follow.start()
@@ -627,16 +666,10 @@ def test_terminal_event_escape_timing():
 
         assert term.event() == "["
         assert term.event() == "A"
-    finally:
-        os.close(read_fd)
-        os.close(write_fd)
 
 def test_terminal_event_resize():
     """Verify resize wakeups coalesce into one Resize event."""
-    read_fd, write_fd = os.pipe()
-    resize_read, resize_write = os.pipe()
-    term = Terminal(read_fd, resize_read)
-    try:
+    with pipe_terminal() as (term, write_fd, resize_write):
         os.write(resize_write, b"\x01\x01\x01")
         event = term.event()
         assert isinstance(event, Resize)
@@ -645,15 +678,23 @@ def test_terminal_event_resize():
 
         os.write(write_fd, b"x")
         assert term.event() == "x"
+
+def test_terminal_event_eof():
+    """Verify a closed input side raises instead of spinning."""
+    read_fd, write_fd = os.pipe()
+    resize_read, resize_write = os.pipe()
+    term = Terminal(read_fd, resize_read)
+    try:
+        os.close(write_fd)
+        with pytest.raises(EOFError):
+            term.event()
     finally:
-        for fd in (read_fd, write_fd, resize_read, resize_write):
+        for fd in (read_fd, resize_read, resize_write):
             os.close(fd)
 
 def test_terminal_event_timeout():
-    """Verify key() returns None when no key arrives within timeout."""
-    read_fd, write_fd = os.pipe()
-    term = Terminal(read_fd)
-    try:
+    """Verify event() returns None when no key arrives within timeout."""
+    with pipe_terminal() as (term, write_fd, _):
         started = time.monotonic()
         assert term.event(timeout=0.05) is None
         assert 0.05 <= time.monotonic() - started < 0.5
@@ -670,15 +711,10 @@ def test_terminal_event_timeout():
         follow.start()
         assert term.event(timeout=0.05) == Key.UP
         follow.join()
-    finally:
-        os.close(read_fd)
-        os.close(write_fd)
 
 def test_terminal_event_paste():
     """Verify bracketed paste arrives as one Paste with normalized text."""
-    read_fd, write_fd = os.pipe()
-    term = Terminal(read_fd)
-    try:
+    with pipe_terminal() as (term, write_fd, _):
         os.write(write_fd, b"\033[200~hello\r\nworld\033[201~")
         assert term.event() == Paste("hello\nworld")
 
@@ -694,20 +730,15 @@ def test_terminal_event_paste():
         os.write(write_fd, b"\033[200~keep\033[201~x")
         assert term.event() == Paste("keep")
         assert term.event() == "x"
-    finally:
-        os.close(read_fd)
-        os.close(write_fd)
 
 def test_terminal_event_unknown_escape_sequence():
-    """Verify unknown escape sequences are returned as raw strings."""
-    read_fd, write_fd = os.pipe()
-    term = Terminal(read_fd)
-    try:
+    """Verify unrecognized escape sequences arrive as Unknown."""
+    with pipe_terminal() as (term, write_fd, _):
         os.write(write_fd, b"\033[1;5A")
-        assert term.event() == "\033[1;5A"
-    finally:
-        os.close(read_fd)
-        os.close(write_fd)
+        assert term.event() == Unknown("\033[1;5A")
+
+        os.write(write_fd, b"\033OH")
+        assert term.event() == Unknown("\033OH")
 
 def test_terminal_size(tmux): # pylint: disable=redefined-outer-name
     """Verify Terminal.size returns correct terminal dimensions."""
@@ -718,7 +749,7 @@ def test_terminal_size(tmux): # pylint: disable=redefined-outer-name
             cols, rows = t.size()
         print(f"SIZE:{cols},{rows}")
     """)
-    assert tmux.wait_for("SIZE:50,20")
+    tmux.wait_for("SIZE:50,20")
     tmux.resize(80, 24)
     tmux.run_python("""
         import terminal as term
@@ -726,7 +757,7 @@ def test_terminal_size(tmux): # pylint: disable=redefined-outer-name
             cols, rows = t.size()
         print(f"SIZE:{cols},{rows}")
     """)
-    assert tmux.wait_for("SIZE:80,24")
+    tmux.wait_for("SIZE:80,24")
 
 def test_terminal_size_runtime(tmux): # pylint: disable=redefined-outer-name
     """Integration test for size updates during an active terminal loop."""
@@ -755,19 +786,19 @@ def test_terminal_size_runtime(tmux): # pylint: disable=redefined-outer-name
         print("DONE", flush=True)
     """)
 
-    assert tmux.wait_for("READY")
+    tmux.wait_for("READY")
 
     tmux.send_keys("a")
-    assert tmux.wait_for("a:80:24")
+    tmux.wait_for("a:80:24")
 
     tmux.resize(50, 20)
     tmux.send_keys("b")
-    assert tmux.wait_for("b:50:20")
+    tmux.wait_for("b:50:20")
 
     tmux.resize(100, 30)
     tmux.send_keys("c")
-    assert tmux.wait_for("c:100:30")
-    assert tmux.wait_for("DONE")
+    tmux.wait_for("c:100:30")
+    tmux.wait_for("DONE")
 
 def test_terminal_resize(tmux): # pylint: disable=redefined-outer-name
     """Integration test for SIGWINCH arriving as a Resize event."""
@@ -789,16 +820,16 @@ def test_terminal_resize(tmux): # pylint: disable=redefined-outer-name
         emit("DONE")
     """)
 
-    assert tmux.wait_for("READY")
+    tmux.wait_for("READY")
 
     tmux.resize(50, 20)
-    assert tmux.wait_for("RESIZE:50:20")
+    tmux.wait_for("RESIZE:50:20")
 
     tmux.resize(100, 30)
-    assert tmux.wait_for("RESIZE:100:30")
+    tmux.wait_for("RESIZE:100:30")
 
     tmux.send_keys("q")
-    assert tmux.wait_for("DONE")
+    tmux.wait_for("DONE")
 
 def test_terminal(tmux): # pylint: disable=redefined-outer-name
     """Verify terminal context modifies and restores attributes."""
@@ -821,9 +852,9 @@ def test_terminal(tmux): # pylint: disable=redefined-outer-name
         if final == orig:
             print("ATTRS_RESTORED")
     """)
-    assert tmux.wait_for("ATTRS_CHANGED")
-    assert tmux.wait_for("ICANON_OFF")
-    assert tmux.wait_for("ATTRS_RESTORED")
+    tmux.wait_for("ATTRS_CHANGED")
+    tmux.wait_for("ICANON_OFF")
+    tmux.wait_for("ATTRS_RESTORED")
 
 def test_terminal_exception(tmux): # pylint: disable=redefined-outer-name
     """Integration test for terminal restoration on exception."""
@@ -851,10 +882,10 @@ def test_terminal_exception(tmux): # pylint: disable=redefined-outer-name
             print("ICANON_ON", flush=True)
     """)
 
-    assert tmux.wait_for("IN_RAW")
-    assert tmux.wait_for("EXC_CAUGHT")
-    assert tmux.wait_for("RESTORED")
-    assert tmux.wait_for("ICANON_ON")
+    tmux.wait_for("IN_RAW")
+    tmux.wait_for("EXC_CAUGHT")
+    tmux.wait_for("RESTORED")
+    tmux.wait_for("ICANON_ON")
 
 def test_terminal_paste(tmux): # pylint: disable=redefined-outer-name
     """Verify a real tmux paste is delivered as a single Paste block."""
@@ -868,11 +899,11 @@ def test_terminal_paste(tmux): # pylint: disable=redefined-outer-name
             print(f"NEXT:{t.event()!r}", flush=True)
     """)
 
-    assert tmux.wait_for("READY")
+    tmux.wait_for("READY")
     tmux.paste("one\ntwo")
-    assert tmux.wait_for(re.escape("GOT:Paste:'one\\ntwo'"))
+    tmux.wait_for(re.escape("GOT:Paste:'one\\ntwo'"))
     tmux.send_keys("z")
-    assert tmux.wait_for(re.escape("NEXT:'z'"))
+    tmux.wait_for(re.escape("NEXT:'z'"))
 
 def test_terminal_alt_screen(tmux): # pylint: disable=redefined-outer-name
     """Verify alt-screen preserves main screen content across terminal()."""
@@ -887,14 +918,14 @@ def test_terminal_alt_screen(tmux): # pylint: disable=redefined-outer-name
         print("MARKER_AFTER", flush=True)
     """)
 
-    assert tmux.wait_for("LOOP_READY")
+    tmux.wait_for("LOOP_READY")
     # While inside alt-screen, the main-screen marker must be hidden.
     content = "\n".join(tmux.capture_pane())
     assert "MARKER_BEFORE" not in content
     assert "INSIDE_ALT" in content
 
     tmux.send_keys("a")
-    assert tmux.wait_for("MARKER_AFTER")
+    tmux.wait_for("MARKER_AFTER")
     # After exit, main screen is restored: marker back, alt-screen gone.
     content = "\n".join(tmux.capture_pane())
     assert "MARKER_BEFORE" in content
@@ -936,51 +967,51 @@ def test_terminal_flow(tmux): # pylint: disable=redefined-outer-name
         print("DONE", flush=True)
     """)
 
-    assert tmux.wait_for("SIZE:120,30")
-    assert tmux.wait_for("LOOP_READY")
+    tmux.wait_for("SIZE:120,30")
+    tmux.wait_for("LOOP_READY")
 
     tmux.send_keys("x")
-    assert tmux.wait_for("K:x")
+    tmux.wait_for("K:x")
 
     tmux.send_keys(Key.UP)
-    assert tmux.wait_for("K:UP")
+    tmux.wait_for("K:UP")
 
     tmux.send_keys(Key.DOWN)
-    assert tmux.wait_for("K:DOWN")
+    tmux.wait_for("K:DOWN")
 
     tmux.send_keys(Key.LEFT)
-    assert tmux.wait_for("K:LEFT")
+    tmux.wait_for("K:LEFT")
 
     tmux.send_keys(Key.RIGHT)
-    assert tmux.wait_for("K:RIGHT")
+    tmux.wait_for("K:RIGHT")
 
     tmux.send_keys(Key.DELETE)
-    assert tmux.wait_for("K:DELETE")
+    tmux.wait_for("K:DELETE")
 
     tmux.send_keys(Key.PAGE_UP)
-    assert tmux.wait_for("K:PAGE_UP")
+    tmux.wait_for("K:PAGE_UP")
 
     tmux.send_keys(Key.PAGE_DOWN)
-    assert tmux.wait_for("K:PAGE_DOWN")
+    tmux.wait_for("K:PAGE_DOWN")
 
     tmux.send_keys(Key.TAB)
-    assert tmux.wait_for("K:TAB")
+    tmux.wait_for("K:TAB")
 
     tmux.send_keys(Key.SHIFT_TAB)
-    assert tmux.wait_for("K:SHIFT_TAB")
+    tmux.wait_for("K:SHIFT_TAB")
 
     tmux.send_keys(Key.ESCAPE)
-    assert tmux.wait_for("K:ESCAPE")
+    tmux.wait_for("K:ESCAPE")
 
     for control in (
         Key.CTRL_A, Key.CTRL_B, Key.CTRL_E, Key.CTRL_F, Key.CTRL_W,
     ):
         tmux.send_keys(control)
-        assert tmux.wait_for(f"K:{control.name}")
+        tmux.wait_for(f"K:{control.name}")
 
     tmux.send_keys(Key.CTRL_C)
-    assert tmux.wait_for("K:CTRL_C")
-    assert tmux.wait_for("DONE")
+    tmux.wait_for("K:CTRL_C")
+    tmux.wait_for("DONE")
 
 def test_terminal_clear_and_move(tmux): # pylint: disable=redefined-outer-name
     """Verify tiny-screen updates match full-screen regex snapshots."""
@@ -1017,8 +1048,8 @@ def test_terminal_clear_and_move(tmux): # pylint: disable=redefined-outer-name
                 lines.append("")
         return r"\A" + "\n".join(lines) + r"\Z"
 
-    assert tmux.wait_for(screen(1, 1, "A"))
-    assert tmux.wait_for(screen(2, 2, "B"))
-    assert tmux.wait_for(screen(3, 3, "C"))
-    assert tmux.wait_for(screen(4, 4, "D"))
-    assert tmux.wait_for(screen(5, 5, "E"))
+    tmux.wait_for(screen(1, 1, "A"))
+    tmux.wait_for(screen(2, 2, "B"))
+    tmux.wait_for(screen(3, 3, "C"))
+    tmux.wait_for(screen(4, 4, "D"))
+    tmux.wait_for(screen(5, 5, "E"))

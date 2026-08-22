@@ -4,7 +4,9 @@
 
 - `terminal.py` is the low-level layer: a `terminal()` context manager plus pure-function ANSI helpers; `editor.py` drives the full-screen TUI via `with terminal() as term:`.
 - `terminal()` owns every piece of terminal state with a teardown: termios raw mode, alternate screen, bracketed paste, and the SIGWINCH handler.
-- `Terminal.event()` is the single input entry point; it returns a `Key`, a `str` character, `Paste`, `Resize`, or `None` on timeout, so callers must handle all five.
+- `Terminal.event()` is the single input entry point; it returns a `Key`, a one-character `str`, `Paste`, `Resize`, `Unknown`, or `None` on timeout, and raises `EOFError` when input closes.
+- `Unknown(sequence)` carries an escape sequence with no `Key`. **Why:** a bare `str` made a typed character and a multi-byte sequence indistinguishable, so callers guessed with `len(key) == 1`.
+- `terminal.py` is ordered: event types, `terminal()`, `Terminal`, input parsing helpers, output escape helpers, tests. **Why:** the input path reads top-down without stepping over drawing code.
 - `terminal()` installs a SIGWINCH handler that writes to a self-pipe, and `event()` selects on both the tty and that pipe, so a resize wakes an otherwise blocked read.
 - `editor.py` keeps its own `ResizeEvent` and translates terminal's `Resize` in the main loop. **Why:** adopting terminal's type would churn `reduce_event` and all its tests for no gain.
 - Two test styles live in `terminal.py`: pure unit tests (pipes, `capsys`) and tmux integration tests via `TmuxHelper` (detached session, run Python, assert on captured pane).
@@ -37,7 +39,8 @@
 - Styling is applied after wrapping and truncation. **Why:** embedded ANSI codes would corrupt width calculations during line slicing.
 - Bracketed paste is always on, with no `paste=` flag. **Why:** mode 2004 changes nothing visible until a paste happens, so the only use of `paste=False` would be reproducing the bug it fixes.
 - A paste is delivered as one `Paste` value, not flattened into characters. **Why:** callers must tell a paste from fast typing to insert it as one block and redraw once.
-- Home and End are absent from `Key`: each has three encodings (`\033OH` / `\033[1~` / `\033[H`) and an enum member holds one value. Adding them needs a `_KEY_ALIASES` table consulted before the enum lookup.
+- Home and End are absent from `Key`: each has three encodings (`\033OH` / `\033[1~` / `\033[H`) and an enum member holds one value. Adding one is an entry in `_KEY_ALIASES`, which `_key_from_value` consults before the enum lookup.
+- `Terminal` reads input from `input_fd` but always writes to stdout, and `size()` queries `input_fd` with a `shutil` fallback. **Why:** an earlier `/dev/tty` query ignored the fd the caller passed.
 - The input method is named `event()`, over `poll()`, `read()`, and `next_event()`. **Why:** `poll` implies non-blocking but `timeout=None` blocks; `read` suggests raw bytes; it matches the short-noun style of `size()` and `write()`.
 - `event(timeout=…)` guards only the first byte. **Why:** the escape parser keeps its own small timeouts, so a key that started arriving is never truncated.
 
