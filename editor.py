@@ -469,7 +469,7 @@ def run_editor(file_path: pathlib.Path) -> int:
                         updated = True
                     except queue.Empty:
                         break
-                key = term.key(timeout=0.05)
+                key = term.event(timeout=0.05)
                 if key is not None:
                     state = dispatch(state, KeyEvent(key))
                     updated = True

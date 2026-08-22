@@ -54,6 +54,8 @@ class Paste:
     """Text the terminal delivered as one bracketed-paste block."""
     text: str
 
+Event = Union[Key, str, Paste, None]
+
 @contextmanager
 def terminal(
     fd: Optional[int] = None, alt_screen: bool = True
@@ -82,7 +84,7 @@ def terminal(
 
 
 class Terminal:
-    """Terminal facade for output, size queries, and key input."""
+    """Terminal facade for output, size queries, and input events."""
 
     def __init__(self, fd: int):
         self.fd = fd
@@ -101,14 +103,12 @@ class Terminal:
             size = shutil.get_terminal_size()
         return size.columns, size.lines
 
-    def key(
-        self, timeout: Optional[float] = None
-    ) -> Union[Key, str, Paste, None]:
-        """Reads a key or a pasted block from this terminal instance.
+    def event(self, timeout: Optional[float] = None) -> Event:
+        """Reads the next input event from this terminal instance.
 
         timeout: seconds to wait for the first byte; None waits forever,
-        0 polls. Returns None when no key arrives in time. Once a key
-        starts arriving it is always read to completion.
+        0 polls. Returns None when no event arrives in time. Once an
+        event starts arriving it is always read to completion.
         """
         if timeout is not None:
             if not select.select([self.fd], [], [], timeout)[0]:
@@ -501,7 +501,7 @@ def test_style_no_leak(tmux): # pylint: disable=redefined-outer-name
                 term.move_to(2, 1),
                 "PLAIN",
             )
-            t.key()
+            t.event()
     """)
 
     assert tmux.wait_for("PLAIN")
@@ -516,16 +516,16 @@ def test_terminal_write(capsys):
     captured = capsys.readouterr()
     assert captured.out == "ABC"
 
-def test_terminal_key():
+def test_terminal_event():
     """Verify Terminal.key handles printable and control sequences."""
     read_fd, write_fd = os.pipe()
     term = Terminal(read_fd)
     try:
         os.write(write_fd, b"x")
-        assert term.key() == "x"
+        assert term.event() == "x"
 
         os.write(write_fd, bytes([Key.CTRL_K.value]))
-        assert term.key() == Key.CTRL_K
+        assert term.event() == Key.CTRL_K
 
         for code, control in (
             (1, Key.CTRL_A), (2, Key.CTRL_B), (5, Key.CTRL_E),
@@ -533,51 +533,51 @@ def test_terminal_key():
             (23, Key.CTRL_W),
         ):
             os.write(write_fd, bytes([code]))
-            assert term.key() == control
+            assert term.event() == control
 
         os.write(write_fd, bytes([8]))
-        assert term.key() == Key.BACKSPACE
+        assert term.event() == Key.BACKSPACE
 
         os.write(write_fd, bytes([Key.CTRL_C.value]))
-        assert term.key() == Key.CTRL_C
+        assert term.event() == Key.CTRL_C
 
         os.write(write_fd, bytes([4]))
-        assert term.key() == "\x04"
+        assert term.event() == "\x04"
 
         os.write(write_fd, b"\033[A")
-        assert term.key() == Key.UP
+        assert term.event() == Key.UP
 
         os.write(write_fd, b"\033[B")
-        assert term.key() == Key.DOWN
+        assert term.event() == Key.DOWN
 
         os.write(write_fd, b"\033[D")
-        assert term.key() == Key.LEFT
+        assert term.event() == Key.LEFT
 
         os.write(write_fd, b"\033[C")
-        assert term.key() == Key.RIGHT
+        assert term.event() == Key.RIGHT
 
         os.write(write_fd, b"\033[3~")
-        assert term.key() == Key.DELETE
+        assert term.event() == Key.DELETE
 
         os.write(write_fd, b"\033[5~")
-        assert term.key() == Key.PAGE_UP
+        assert term.event() == Key.PAGE_UP
 
         os.write(write_fd, b"\033[6~")
-        assert term.key() == Key.PAGE_DOWN
+        assert term.event() == Key.PAGE_DOWN
 
         os.write(write_fd, bytes([9]))
-        assert term.key() == Key.TAB
+        assert term.event() == Key.TAB
 
         os.write(write_fd, b"\033[Z")
-        assert term.key() == Key.SHIFT_TAB
+        assert term.event() == Key.SHIFT_TAB
 
         os.write(write_fd, bytes([Key.ESCAPE.value]))
-        assert term.key() == Key.ESCAPE
+        assert term.event() == Key.ESCAPE
     finally:
         os.close(read_fd)
         os.close(write_fd)
 
-def test_terminal_key_escape_timing():
+def test_terminal_event_escape_timing():
     """Verify ESC is disambiguated by trailing-byte timing."""
     read_fd, write_fd = os.pipe()
     term = Terminal(read_fd)
@@ -585,77 +585,77 @@ def test_terminal_key_escape_timing():
         os.write(write_fd, b"\033")
         fast_follow = threading.Timer(0.02, os.write, args=(write_fd, b"[A"))
         fast_follow.start()
-        assert term.key() == Key.UP
+        assert term.event() == Key.UP
         fast_follow.join()
 
         os.write(write_fd, b"\033")
         slow_follow = threading.Timer(0.2, os.write, args=(write_fd, b"[A"))
         slow_follow.start()
-        assert term.key() == Key.ESCAPE
+        assert term.event() == Key.ESCAPE
         slow_follow.join()
 
-        assert term.key() == "["
-        assert term.key() == "A"
+        assert term.event() == "["
+        assert term.event() == "A"
     finally:
         os.close(read_fd)
         os.close(write_fd)
 
-def test_terminal_key_timeout():
+def test_terminal_event_timeout():
     """Verify key() returns None when no key arrives within timeout."""
     read_fd, write_fd = os.pipe()
     term = Terminal(read_fd)
     try:
         started = time.monotonic()
-        assert term.key(timeout=0.05) is None
+        assert term.event(timeout=0.05) is None
         assert 0.05 <= time.monotonic() - started < 0.5
 
-        assert term.key(timeout=0) is None
+        assert term.event(timeout=0) is None
 
         os.write(write_fd, b"x")
         started = time.monotonic()
-        assert term.key(timeout=1.0) == "x"
+        assert term.event(timeout=1.0) == "x"
         assert time.monotonic() - started < 0.5
 
         os.write(write_fd, b"\033")
         follow = threading.Timer(0.02, os.write, args=(write_fd, b"[A"))
         follow.start()
-        assert term.key(timeout=0.05) == Key.UP
+        assert term.event(timeout=0.05) == Key.UP
         follow.join()
     finally:
         os.close(read_fd)
         os.close(write_fd)
 
-def test_terminal_key_paste():
+def test_terminal_event_paste():
     """Verify bracketed paste arrives as one Paste with normalized text."""
     read_fd, write_fd = os.pipe()
     term = Terminal(read_fd)
     try:
         os.write(write_fd, b"\033[200~hello\r\nworld\033[201~")
-        assert term.key() == Paste("hello\nworld")
+        assert term.event() == Paste("hello\nworld")
 
         os.write(write_fd, "\033[200~caf\u00e9 \U0001f600\033[201~".encode())
-        assert term.key() == Paste("caf\u00e9 \U0001f600")
+        assert term.event() == Paste("caf\u00e9 \U0001f600")
 
         os.write(write_fd, b"\033[200~\033[201~")
-        assert term.key() == Paste("")
+        assert term.event() == Paste("")
 
         os.write(write_fd, b"\033[200~a\033[2Jb\033[201~")
-        assert term.key() == Paste("a[2Jb")
+        assert term.event() == Paste("a[2Jb")
 
         os.write(write_fd, b"\033[200~keep\033[201~x")
-        assert term.key() == Paste("keep")
-        assert term.key() == "x"
+        assert term.event() == Paste("keep")
+        assert term.event() == "x"
     finally:
         os.close(read_fd)
         os.close(write_fd)
 
-def test_terminal_key_unknown_escape_sequence():
+def test_terminal_event_unknown_escape_sequence():
     """Verify unknown escape sequences are returned as raw strings."""
     read_fd, write_fd = os.pipe()
     term = Terminal(read_fd)
     try:
         os.write(write_fd, b"\033[1;5A")
-        assert term.key() == "\033[1;5A"
+        assert term.event() == "\033[1;5A"
     finally:
         os.close(read_fd)
         os.close(write_fd)
@@ -693,7 +693,7 @@ def test_terminal_size_runtime(tmux): # pylint: disable=redefined-outer-name
         with term.terminal(alt_screen=False) as t:
             print("READY", flush=True)
             for _ in range(3):
-                key = t.key()
+                key = t.event()
                 cols, rows = t.size()
                 print(f"{key_to_string(key)}:{cols}:{rows}", flush=True)
 
@@ -777,9 +777,9 @@ def test_terminal_paste(tmux): # pylint: disable=redefined-outer-name
 
         with term.terminal(alt_screen=False) as t:
             print("READY", flush=True)
-            event = t.key()
+            event = t.event()
             print(f"GOT:{type(event).__name__}:{event.text!r}", flush=True)
-            print(f"NEXT:{t.key()!r}", flush=True)
+            print(f"NEXT:{t.event()!r}", flush=True)
     """)
 
     assert tmux.wait_for("READY")
@@ -797,7 +797,7 @@ def test_terminal_alt_screen(tmux): # pylint: disable=redefined-outer-name
         with term.terminal() as t:
             t.write(term.clear_screen(), term.move_to(1, 1), "INSIDE_ALT")
             print("LOOP_READY", flush=True)
-            t.key()
+            t.event()
         print("MARKER_AFTER", flush=True)
     """)
 
@@ -842,7 +842,7 @@ def test_terminal_flow(tmux): # pylint: disable=redefined-outer-name
             print("LOOP_READY", end="\r\n", flush=True)
 
             while True:
-                key = t.key()
+                key = t.event()
                 print(f"K:{key_to_string(key)}", end="\r\n", flush=True)
                 if key == Key.CTRL_C:
                     break
