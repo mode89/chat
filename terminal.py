@@ -27,14 +27,23 @@ from typing import Iterator, Union, Tuple, List, Optional
 
 class Key(enum.Enum):
     """Semantic terminal control keys."""
+    CTRL_A = 1
+    CTRL_B = 2
+    CTRL_E = 5
+    CTRL_F = 6
     CTRL_K = 11
     CTRL_J = 10
     CTRL_U = 21
+    CTRL_W = 23
+    TAB = 9
     ENTER = 13
     CTRL_C = 3
     ESCAPE = 27
     BACKSPACE = 127
+    SHIFT_TAB = "\033[Z"
     DELETE = "\033[3~"
+    PAGE_UP = "\033[5~"
+    PAGE_DOWN = "\033[6~"
     UP = "\033[A"
     DOWN = "\033[B"
     LEFT = "\033[D"
@@ -289,14 +298,23 @@ class TmuxHelper:
         self.session_name = session_name or f"test_{int(time.time() * 1000)}"
         self.temp_dir = None
         self._key_map = {
+            Key.CTRL_A: "C-a",
+            Key.CTRL_B: "C-b",
+            Key.CTRL_E: "C-e",
+            Key.CTRL_F: "C-f",
             Key.CTRL_K: "C-k",
             Key.CTRL_J: "C-j",
             Key.CTRL_U: "C-u",
+            Key.CTRL_W: "C-w",
+            Key.TAB: "Tab",
+            Key.SHIFT_TAB: "BTab",
             Key.ENTER: "Enter",
             Key.CTRL_C: "C-c",
             Key.ESCAPE: "Escape",
             Key.BACKSPACE: "BSpace",
             Key.DELETE: "Delete",
+            Key.PAGE_UP: "PageUp",
+            Key.PAGE_DOWN: "PageDown",
             Key.UP: "Up",
             Key.DOWN: "Down",
             Key.LEFT: "Left",
@@ -509,6 +527,14 @@ def test_terminal_key():
         os.write(write_fd, bytes([Key.CTRL_K.value]))
         assert term.key() == Key.CTRL_K
 
+        for code, control in (
+            (1, Key.CTRL_A), (2, Key.CTRL_B), (5, Key.CTRL_E),
+            (6, Key.CTRL_F), (10, Key.CTRL_J), (21, Key.CTRL_U),
+            (23, Key.CTRL_W),
+        ):
+            os.write(write_fd, bytes([code]))
+            assert term.key() == control
+
         os.write(write_fd, bytes([8]))
         assert term.key() == Key.BACKSPACE
 
@@ -532,6 +558,18 @@ def test_terminal_key():
 
         os.write(write_fd, b"\033[3~")
         assert term.key() == Key.DELETE
+
+        os.write(write_fd, b"\033[5~")
+        assert term.key() == Key.PAGE_UP
+
+        os.write(write_fd, b"\033[6~")
+        assert term.key() == Key.PAGE_DOWN
+
+        os.write(write_fd, bytes([9]))
+        assert term.key() == Key.TAB
+
+        os.write(write_fd, b"\033[Z")
+        assert term.key() == Key.SHIFT_TAB
 
         os.write(write_fd, bytes([Key.ESCAPE.value]))
         assert term.key() == Key.ESCAPE
@@ -833,8 +871,26 @@ def test_terminal_flow(tmux): # pylint: disable=redefined-outer-name
     tmux.send_keys(Key.DELETE)
     assert tmux.wait_for("K:DELETE")
 
+    tmux.send_keys(Key.PAGE_UP)
+    assert tmux.wait_for("K:PAGE_UP")
+
+    tmux.send_keys(Key.PAGE_DOWN)
+    assert tmux.wait_for("K:PAGE_DOWN")
+
+    tmux.send_keys(Key.TAB)
+    assert tmux.wait_for("K:TAB")
+
+    tmux.send_keys(Key.SHIFT_TAB)
+    assert tmux.wait_for("K:SHIFT_TAB")
+
     tmux.send_keys(Key.ESCAPE)
     assert tmux.wait_for("K:ESCAPE")
+
+    for control in (
+        Key.CTRL_A, Key.CTRL_B, Key.CTRL_E, Key.CTRL_F, Key.CTRL_W,
+    ):
+        tmux.send_keys(control)
+        assert tmux.wait_for(f"K:{control.name}")
 
     tmux.send_keys(Key.CTRL_C)
     assert tmux.wait_for("K:CTRL_C")
