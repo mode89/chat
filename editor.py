@@ -17,6 +17,7 @@ from typing import Callable, List, Sequence, Tuple, Union
 
 from terminal import ( # pylint: disable=unused-import
     Key,
+    Paste,
     clear_screen,
     cursor,
     move_to,
@@ -52,7 +53,7 @@ class EditorState:  # pylint: disable=too-many-instance-attributes
 class KeyEvent:
     """Input key event."""
 
-    key: Union[Key, str]
+    key: Union[Key, str, Paste]
 
 
 @dataclass(frozen=True)
@@ -176,6 +177,16 @@ def insert_char(state: EditorState, char: str) -> EditorState:
     return replace_lines(state, lines, row, col + 1)
 
 
+def insert_text(state: EditorState, text: str) -> EditorState:
+    """Inserts multi-line text at the cursor, one character at a time."""
+    for char in text:
+        if char == "\n":
+            state = split_line(state)
+        elif should_insert_char(char):
+            state = insert_char(state, char)
+    return state
+
+
 def split_line(state: EditorState) -> EditorState:
     """Splits the current line at the cursor."""
     row, col = state.cursor
@@ -290,6 +301,8 @@ def reduce_event(
         return state, []
 
     # INSERT mode
+    if isinstance(key, Paste):
+        return insert_text(state, key.text), effects
     if key == Key.ESCAPE:
         next_state = to_normal_mode(state)
     elif key == Key.ENTER:
@@ -548,6 +561,19 @@ def test_enter_split_backspace_merge():
     state, _ = reduce_event(state, KeyEvent(Key.BACKSPACE))
     assert state.lines == ("ab",)
     assert state.cursor == (0, 1)
+
+
+def test_paste_inserts_block():
+    """Paste inserts multi-line text in one event, only in INSERT mode."""
+    state = make_state(["ab"], row=0, col=1, mode=Mode.INSERT)
+
+    state, _ = reduce_event(state, KeyEvent(Paste("X\nY")))
+    assert state.lines == ("aX", "Yb")
+    assert state.cursor == (1, 1)
+
+    normal = make_state(["ab"], mode=Mode.NORMAL)
+    unchanged, _ = reduce_event(normal, KeyEvent(Paste("X")))
+    assert unchanged.lines == ("ab",)
 
 
 def test_render_status_mode_size():

@@ -22,6 +22,7 @@ import textwrap
 import time
 import tty
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Iterator, Union, Tuple, List, Optional
 
 class Key(enum.Enum):
@@ -39,13 +40,19 @@ class Key(enum.Enum):
     LEFT = "\033[D"
     RIGHT = "\033[C"
 
+@dataclass(frozen=True)
+class Paste:
+    """Text the terminal delivered as one bracketed-paste block."""
+    text: str
+
 @contextmanager
 def terminal(
     fd: Optional[int] = None, alt_screen: bool = True
 ) -> Iterator["Terminal"]:
     """
     Saves termios attributes, applies raw mode, switches to the
-    alternate screen buffer, and restores everything on exit.
+    alternate screen buffer, enables bracketed paste, and restores
+    everything on exit.
     """
     fd = sys.stdin.fileno() if fd is None else fd
     original_attrs = termios.tcgetattr(fd)
@@ -53,10 +60,12 @@ def terminal(
         tty.setraw(fd)
         if alt_screen:
             sys.stdout.write("\033[?1049h")
-            sys.stdout.flush()
+        sys.stdout.write("\033[?2004h")
+        sys.stdout.flush()
         yield Terminal(fd)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, original_attrs)
+        sys.stdout.write("\033[?2004l")
         if alt_screen:
             sys.stdout.write("\033[?1049l")
         sys.stdout.write(cursor(True))
@@ -85,8 +94,8 @@ class Terminal:
 
     def key(
         self, timeout: Optional[float] = None
-    ) -> Union[Key, str, None]:
-        """Reads a key from this terminal instance.
+    ) -> Union[Key, str, Paste, None]:
+        """Reads a key or a pasted block from this terminal instance.
 
         timeout: seconds to wait for the first byte; None waits forever,
         0 polls. Returns None when no key arrives in time. Once a key
@@ -193,6 +202,10 @@ def restore_pos() -> str:
     """Returns ANSI sequence to restore cursor position."""
     return "\033[u"
 
+_PASTE_START = "\033[200~"
+_PASTE_END = "\033[201~"
+_PASTE_TIMEOUT = 1.0
+
 def _key_from_value(value: Union[int, str]) -> Optional[Key]:
     """Converts a key code or ANSI sequence to Key when supported."""
     try:
@@ -200,7 +213,7 @@ def _key_from_value(value: Union[int, str]) -> Optional[Key]:
     except ValueError:
         return None
 
-def _parse_escape(fd: int) -> Union[Key, str]:
+def _parse_escape(fd: int) -> Union[Key, str, Paste]:
     """Parses an escape-prefixed key sequence from fd."""
     if not select.select([fd], [], [], 0.1)[0]:
         return Key.ESCAPE
@@ -212,24 +225,44 @@ def _parse_escape(fd: int) -> Union[Key, str]:
         )
         return _key_from_value(sequence) or sequence
 
-    if not select.select([fd], [], [], 0.05)[0]:
-        return "\033["
-
-    third = os.read(fd, 1)
-    if third == b"3":
-        suffix = b""
-        if select.select([fd], [], [], 0.05)[0]:
-            suffix = os.read(fd, 1)
-        sequence = (
-            "\033[" + (third + suffix + _read_available(fd))
-                .decode("utf-8", errors="ignore")
-        )
-        return _key_from_value(sequence) or sequence
-
-    sequence = "\033[" + (third + _read_available(fd)).decode(
-        "utf-8", errors="ignore"
-    )
+    sequence = "\033[" + _read_csi(fd)
+    if sequence == _PASTE_START:
+        return Paste(_read_paste(fd))
     return _key_from_value(sequence) or sequence
+
+def _read_csi(fd: int) -> str:
+    """Reads CSI bytes up to and including the final byte (0x40-0x7E)."""
+    chunks = []
+    while select.select([fd], [], [], 0.05)[0]:
+        byte = os.read(fd, 1)
+        if not byte:
+            break
+        chunks.append(byte)
+        if 0x40 <= byte[0] <= 0x7E:
+            break
+    return b"".join(chunks).decode("utf-8", errors="ignore")
+
+def _read_paste(fd: int) -> str:
+    """Reads pasted bytes up to the bracketed-paste end marker."""
+    end_marker = _PASTE_END.encode()
+    buffer = bytearray()
+    while not buffer.endswith(end_marker):
+        if not select.select([fd], [], [], _PASTE_TIMEOUT)[0]:
+            break
+        byte = os.read(fd, 1)
+        if not byte:
+            break
+        buffer += byte
+    text = bytes(buffer).decode("utf-8", errors="replace")
+    return _sanitize_paste(text.removesuffix(_PASTE_END))
+
+def _sanitize_paste(text: str) -> str:
+    """Normalizes newlines and drops control characters from pasted text."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(
+        char for char in text
+        if char in "\n\t" or (ord(char) >= 32 and ord(char) != 127)
+    )
 
 def _read_available(fd: int) -> bytes:
     """Reads all currently-available bytes from fd without blocking."""
@@ -371,6 +404,11 @@ class TmuxHelper:
                 return match
             time.sleep(0.01)
         return None
+
+    def paste(self, text: str):
+        """Pastes text into the session using bracketed paste."""
+        self._run_tmux("set-buffer", "-t", self.session_name, text)
+        self._run_tmux("paste-buffer", "-p", "-t", self.session_name)
 
     def run_python(self, code: str):
         """Executes Python code within the tmux session."""
@@ -549,6 +587,30 @@ def test_terminal_key_timeout():
         os.close(read_fd)
         os.close(write_fd)
 
+def test_terminal_key_paste():
+    """Verify bracketed paste arrives as one Paste with normalized text."""
+    read_fd, write_fd = os.pipe()
+    term = Terminal(read_fd)
+    try:
+        os.write(write_fd, b"\033[200~hello\r\nworld\033[201~")
+        assert term.key() == Paste("hello\nworld")
+
+        os.write(write_fd, "\033[200~caf\u00e9 \U0001f600\033[201~".encode())
+        assert term.key() == Paste("caf\u00e9 \U0001f600")
+
+        os.write(write_fd, b"\033[200~\033[201~")
+        assert term.key() == Paste("")
+
+        os.write(write_fd, b"\033[200~a\033[2Jb\033[201~")
+        assert term.key() == Paste("a[2Jb")
+
+        os.write(write_fd, b"\033[200~keep\033[201~x")
+        assert term.key() == Paste("keep")
+        assert term.key() == "x"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
 def test_terminal_key_unknown_escape_sequence():
     """Verify unknown escape sequences are returned as raw strings."""
     read_fd, write_fd = os.pipe()
@@ -669,6 +731,24 @@ def test_terminal_exception(tmux): # pylint: disable=redefined-outer-name
     assert tmux.wait_for("EXC_CAUGHT")
     assert tmux.wait_for("RESTORED")
     assert tmux.wait_for("ICANON_ON")
+
+def test_terminal_paste(tmux): # pylint: disable=redefined-outer-name
+    """Verify a real tmux paste is delivered as a single Paste block."""
+    tmux.run_python("""
+        import terminal as term
+
+        with term.terminal(alt_screen=False) as t:
+            print("READY", flush=True)
+            event = t.key()
+            print(f"GOT:{type(event).__name__}:{event.text!r}", flush=True)
+            print(f"NEXT:{t.key()!r}", flush=True)
+    """)
+
+    assert tmux.wait_for("READY")
+    tmux.paste("one\ntwo")
+    assert tmux.wait_for(re.escape("GOT:Paste:'one\\ntwo'"))
+    tmux.send_keys("z")
+    assert tmux.wait_for(re.escape("NEXT:'z'"))
 
 def test_terminal_alt_screen(tmux): # pylint: disable=redefined-outer-name
     """Verify alt-screen preserves main screen content across terminal()."""
