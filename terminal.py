@@ -780,7 +780,7 @@ def test_terminal_alt_screen(tmux): # pylint: disable=redefined-outer-name
 def test_terminal_flow(tmux): # pylint: disable=redefined-outer-name
     """Integration test for terminal helpers in raw mode."""
     tmux.resize(120, 30)
-    tmux.run_python("""
+    tmux.run_python(r"""
         import terminal as term
         from terminal import Key
 
@@ -800,12 +800,12 @@ def test_terminal_flow(tmux): # pylint: disable=redefined-outer-name
                 term.restore_pos(),
                 term.cursor(True),
             )
-            print(f"SIZE:{cols},{rows}", flush=True)
-            print("LOOP_READY", flush=True)
+            print(f"SIZE:{cols},{rows}", end="\r\n", flush=True)
+            print("LOOP_READY", end="\r\n", flush=True)
 
             while True:
                 key = t.key()
-                print(f"K:{key_to_string(key)}", flush=True)
+                print(f"K:{key_to_string(key)}", end="\r\n", flush=True)
                 if key == Key.CTRL_C:
                     break
 
