@@ -284,6 +284,8 @@ def _read_paste(fd: int) -> str:
     """Reads pasted bytes up to the bracketed-paste end marker."""
     end_marker = _PASTE_END.encode()
     buffer = bytearray()
+    # One byte per read: a chunked read would run past the end marker and
+    # swallow keystrokes typed right after the paste.
     while not buffer.endswith(end_marker):
         if not select.select([fd], [], [], _PASTE_TIMEOUT)[0]:
             break
