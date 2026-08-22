@@ -9,7 +9,6 @@
 import enum
 import pathlib
 import queue
-import select
 import sys
 import threading
 import time
@@ -457,8 +456,9 @@ def run_editor(file_path: pathlib.Path) -> int:
                         updated = True
                     except queue.Empty:
                         break
-                if select.select([term.fd], [], [], 0.05)[0]:
-                    state = dispatch(state, KeyEvent(term.key()))
+                key = term.key(timeout=0.05)
+                if key is not None:
+                    state = dispatch(state, KeyEvent(key))
                     updated = True
                 if not state.should_quit and updated:
                     term.write(render(state))

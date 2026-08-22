@@ -83,8 +83,19 @@ class Terminal:
             size = shutil.get_terminal_size()
         return size.columns, size.lines
 
-    def key(self) -> Union[Key, str]:
-        """Reads a key from this terminal instance."""
+    def key(
+        self, timeout: Optional[float] = None
+    ) -> Union[Key, str, None]:
+        """Reads a key from this terminal instance.
+
+        timeout: seconds to wait for the first byte; None waits forever,
+        0 polls. Returns None when no key arrives in time. Once a key
+        starts arriving it is always read to completion.
+        """
+        if timeout is not None:
+            if not select.select([self.fd], [], [], timeout)[0]:
+                return None
+
         first = os.read(self.fd, 1)
         while not first:
             first = os.read(self.fd, 1)
@@ -509,6 +520,31 @@ def test_terminal_key_escape_timing():
 
         assert term.key() == "["
         assert term.key() == "A"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+def test_terminal_key_timeout():
+    """Verify key() returns None when no key arrives within timeout."""
+    read_fd, write_fd = os.pipe()
+    term = Terminal(read_fd)
+    try:
+        started = time.monotonic()
+        assert term.key(timeout=0.05) is None
+        assert 0.05 <= time.monotonic() - started < 0.5
+
+        assert term.key(timeout=0) is None
+
+        os.write(write_fd, b"x")
+        started = time.monotonic()
+        assert term.key(timeout=1.0) == "x"
+        assert time.monotonic() - started < 0.5
+
+        os.write(write_fd, b"\033")
+        follow = threading.Timer(0.02, os.write, args=(write_fd, b"[A"))
+        follow.start()
+        assert term.key(timeout=0.05) == Key.UP
+        follow.join()
     finally:
         os.close(read_fd)
         os.close(write_fd)
