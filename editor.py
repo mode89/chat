@@ -8,16 +8,15 @@
 
 import enum
 import pathlib
-import queue
 import sys
-import threading
 import time
 from dataclasses import dataclass, replace
-from typing import Callable, List, Sequence, Tuple, Union
+from typing import List, Sequence, Tuple, Union
 
 from terminal import ( # pylint: disable=unused-import
     Key,
     Paste,
+    Resize,
     clear_screen,
     cursor,
     move_to,
@@ -412,21 +411,6 @@ def run_effects(
     return state
 
 
-def resize_watcher_loop(
-    size_provider: Callable[[], Tuple[int, int]],
-    emit: Callable[[Tuple[int, int]], None],
-    stop_event: threading.Event,
-    interval: float = 0.1,
-):
-    """Polls terminal size and emits changes."""
-    previous = size_provider()
-    while not stop_event.wait(interval):
-        current = size_provider()
-        if current != previous:
-            previous = current
-            emit(current)
-
-
 def run_editor(file_path: pathlib.Path) -> int:
     """Runs the terminal editor loop."""
     def dispatch(state: EditorState, event: Event) -> EditorState:
@@ -434,8 +418,6 @@ def run_editor(file_path: pathlib.Path) -> int:
         return run_effects(next_state, effects)
 
     lines = read_file_lines(file_path)
-    resize_queue: queue.Queue[ResizeEvent] = queue.Queue()
-    stop_event = threading.Event()
 
     with terminal() as term:
         cols, rows = term.size()
@@ -448,36 +430,16 @@ def run_editor(file_path: pathlib.Path) -> int:
             cols=cols,
             rows=rows,
         ))
-        watcher = threading.Thread(
-            target=resize_watcher_loop,
-            args=(
-                term.size,
-                lambda s: resize_queue.put(ResizeEvent(*s)),
-                stop_event,
-            ),
-            daemon=True,
-        )
-        watcher.start()
         term.write(render(state))
 
-        try:
-            while not state.should_quit:
-                updated = False
-                while True:
-                    try:
-                        state = dispatch(state, resize_queue.get_nowait())
-                        updated = True
-                    except queue.Empty:
-                        break
-                key = term.event(timeout=0.05)
-                if key is not None:
-                    state = dispatch(state, KeyEvent(key))
-                    updated = True
-                if not state.should_quit and updated:
-                    term.write(render(state))
-        finally:
-            stop_event.set()
-            watcher.join(timeout=1.0)
+        while not state.should_quit:
+            event = term.event()
+            if isinstance(event, Resize):
+                state = dispatch(state, ResizeEvent(event.cols, event.rows))
+            else:
+                state = dispatch(state, KeyEvent(event))
+            if not state.should_quit:
+                term.write(render(state))
 
     return 0
 
@@ -619,39 +581,6 @@ def test_scroll_cursor_moves_before_viewport_scrolls():
     state, _ = reduce_event(state, KeyEvent("j"))
     assert state.cursor == (5, 0)
     assert state.top_line == 2
-
-
-def test_resize_watcher():
-    """Resize watcher emits new dimensions when size changes."""
-    sizes = iter(
-        [
-            (80, 24),
-            (80, 24),
-            (90, 24),
-            (90, 24),
-            (90, 25),
-        ]
-    )
-
-    def size_provider() -> Tuple[int, int]:
-        try:
-            return next(sizes)
-        except StopIteration:
-            return (90, 25)
-
-    seen: List[Tuple[int, int]] = []
-    stop_event = threading.Event()
-    thread = threading.Thread(
-        target=resize_watcher_loop,
-        args=(size_provider, seen.append, stop_event, 0.01),
-        daemon=True,
-    )
-    thread.start()
-    time.sleep(0.07)
-    stop_event.set()
-    thread.join(timeout=1.0)
-
-    assert seen == [(90, 24), (90, 25)]
 
 
 def test_command_mode_entry():

@@ -6,6 +6,7 @@ Terminal management library for low-level terminal control and input handling.
 # Linting: pylint --max-line-length=80 terminal.py
 
 # pylint: disable=import-error
+# pylint: disable=too-many-lines
 
 import enum
 import os
@@ -13,6 +14,7 @@ import pathlib
 import re
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -54,7 +56,13 @@ class Paste:
     """Text the terminal delivered as one bracketed-paste block."""
     text: str
 
-Event = Union[Key, str, Paste, None]
+@dataclass(frozen=True)
+class Resize:
+    """New terminal dimensions after the window changed size."""
+    cols: int
+    rows: int
+
+Event = Union[Key, str, Paste, Resize, None]
 
 @contextmanager
 def terminal(
@@ -62,19 +70,32 @@ def terminal(
 ) -> Iterator["Terminal"]:
     """
     Saves termios attributes, applies raw mode, switches to the
-    alternate screen buffer, enables bracketed paste, and restores
-    everything on exit.
+    alternate screen buffer, enables bracketed paste, reports window
+    resizes, and restores everything on exit.
     """
     fd = sys.stdin.fileno() if fd is None else fd
     original_attrs = termios.tcgetattr(fd)
+    resize_read, resize_write = os.pipe()
+    os.set_blocking(resize_write, False)
+
+    def on_winch(_signum, _frame):
+        try:
+            os.write(resize_write, b"\x01")
+        except BlockingIOError:
+            pass
+
+    previous_winch = signal.signal(signal.SIGWINCH, on_winch)
     try:
         tty.setraw(fd)
         if alt_screen:
             sys.stdout.write("\033[?1049h")
         sys.stdout.write("\033[?2004h")
         sys.stdout.flush()
-        yield Terminal(fd)
+        yield Terminal(fd, resize_read)
     finally:
+        signal.signal(signal.SIGWINCH, previous_winch)
+        os.close(resize_write)
+        os.close(resize_read)
         termios.tcsetattr(fd, termios.TCSADRAIN, original_attrs)
         sys.stdout.write("\033[?2004l")
         if alt_screen:
@@ -86,8 +107,9 @@ def terminal(
 class Terminal:
     """Terminal facade for output, size queries, and input events."""
 
-    def __init__(self, fd: int):
+    def __init__(self, fd: int, resize_fd: Optional[int] = None):
         self.fd = fd
+        self.resize_fd = resize_fd
 
     def write(self, *sequences: str):
         """Writes all sequences to stdout and flushes."""
@@ -110,9 +132,16 @@ class Terminal:
         0 polls. Returns None when no event arrives in time. Once an
         event starts arriving it is always read to completion.
         """
-        if timeout is not None:
-            if not select.select([self.fd], [], [], timeout)[0]:
-                return None
+        watched = [self.fd]
+        if self.resize_fd is not None:
+            watched.append(self.resize_fd)
+
+        ready = select.select(watched, [], [], timeout)[0]
+        if not ready:
+            return None
+        if self.resize_fd in ready:
+            os.read(self.resize_fd, 64)  # coalesce a burst into one Resize
+            return Resize(*self.size())
 
         first = os.read(self.fd, 1)
         while not first:
@@ -600,6 +629,24 @@ def test_terminal_event_escape_timing():
         os.close(read_fd)
         os.close(write_fd)
 
+def test_terminal_event_resize():
+    """Verify resize wakeups coalesce into one Resize event."""
+    read_fd, write_fd = os.pipe()
+    resize_read, resize_write = os.pipe()
+    term = Terminal(read_fd, resize_read)
+    try:
+        os.write(resize_write, b"\x01\x01\x01")
+        event = term.event()
+        assert isinstance(event, Resize)
+        assert (event.cols, event.rows) == term.size()
+        assert term.event(timeout=0.05) is None
+
+        os.write(write_fd, b"x")
+        assert term.event() == "x"
+    finally:
+        for fd in (read_fd, write_fd, resize_read, resize_write):
+            os.close(fd)
+
 def test_terminal_event_timeout():
     """Verify key() returns None when no key arrives within timeout."""
     read_fd, write_fd = os.pipe()
@@ -690,10 +737,16 @@ def test_terminal_size_runtime(tmux): # pylint: disable=redefined-outer-name
                 return key
             return key.name
 
+        def next_key(t):
+            while True:
+                event = t.event()
+                if not isinstance(event, term.Resize):
+                    return event
+
         with term.terminal(alt_screen=False) as t:
             print("READY", flush=True)
             for _ in range(3):
-                key = t.event()
+                key = next_key(t)
                 cols, rows = t.size()
                 print(f"{key_to_string(key)}:{cols}:{rows}", flush=True)
 
@@ -712,6 +765,37 @@ def test_terminal_size_runtime(tmux): # pylint: disable=redefined-outer-name
     tmux.resize(100, 30)
     tmux.send_keys("c")
     assert tmux.wait_for("c:100:30")
+    assert tmux.wait_for("DONE")
+
+def test_terminal_resize(tmux): # pylint: disable=redefined-outer-name
+    """Integration test for SIGWINCH arriving as a Resize event."""
+    tmux.resize(80, 24)
+    tmux.run_python(r"""
+        import terminal as term
+
+        def emit(line):
+            print(line, end="\r\n", flush=True)
+
+        with term.terminal(alt_screen=False) as t:
+            emit("READY")
+            while True:
+                event = t.event()
+                if isinstance(event, term.Resize):
+                    emit(f"RESIZE:{event.cols}:{event.rows}")
+                elif event == "q":
+                    break
+        emit("DONE")
+    """)
+
+    assert tmux.wait_for("READY")
+
+    tmux.resize(50, 20)
+    assert tmux.wait_for("RESIZE:50:20")
+
+    tmux.resize(100, 30)
+    assert tmux.wait_for("RESIZE:100:30")
+
+    tmux.send_keys("q")
     assert tmux.wait_for("DONE")
 
 def test_terminal(tmux): # pylint: disable=redefined-outer-name
